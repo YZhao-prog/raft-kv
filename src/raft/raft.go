@@ -28,6 +28,16 @@ import (
 	"course/labrpc"
 )
 
+
+// Role defines the role/state of a Raft server (Follower, Leader, or Candidate).
+type Role string
+
+const (
+	Follower  Role = "Follower"  // Server is a follower, listening to leader
+	Leader    Role = "Leader"    // Server is the current leader, managing log replication
+	Candidate Role = "Candidate" // Server is a candidate, requesting votes for leadership
+)
+
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -60,7 +70,60 @@ type Raft struct {
 	// Your data here (PartA, PartB, PartC).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	role Role
+	currentTerm int
+	votedFor int // -1 if no one, otherwise candidate's id
+	electionStart time.Time // time when election started, used for election timeout
+	electionTimeout time.Duration // duration of election timeout, random between 150-300ms
+}
 
+// becomeFollowerLocked transitions the Raft server to the Follower role.
+// If the given term is less than the current term, logs an error and does not transition roles.
+// If the term is higher, resets the votedFor field.
+// Updates the currentTerm to the specified term.
+func (rf *Raft) becomeFollowerLocked(term int) {
+	if term < rf.currentTerm {
+		LOG(rf.me, term, DError, "Can't become follower in term %d, current term is %d", term, rf.currentTerm)
+	}
+
+	LOG(rf.me, term, DLog, "%s->Follower, For T%s->T%s", rf.role, rf.currentTerm, term)
+	rf.role = Follower
+	if term > rf.currentTerm {
+		rf.votedFor = -1
+	}
+	rf.currentTerm = term
+}
+
+
+// becomeCandidateLocked transitions the Raft server to the Candidate role.
+// If the server is currently the Leader, it logs an error and returns without changing state.
+// Otherwise, it updates its role to Candidate, increments its term, votes for itself,
+// and records the time the election started.
+func (rf *Raft) becomeCandidateLocked(term int) {
+	if rf.role == Leader {	
+		LOG(rf.me, term, DError, "Can't become candidate, already leader")
+		return
+	}
+
+	LOG(rf.me, rf.currentTerm, DVote, "%s->Candidate, For T%s->T%s", rf.role, rf.currentTerm, term)
+	rf.currentTerm++
+	rf.role = Candidate
+	rf.votedFor = rf.me
+	rf.electionStart = time.Now()
+}
+
+// becomeLeaderLocked transitions the Raft server to the Leader role.
+// It should only be called when the server is a Candidate and is to become the Leader.
+// Logs an error and does not proceed if not currently a Candidate.
+// Updates the role to Leader and logs the transition.
+func (rf *Raft) becomeLeaderLocked(term int) {
+	if rf.role != Candidate {
+		LOG(rf.me, term, DError, "Can't become leader, not a candidate")
+		return
+	}
+
+	LOG(rf.me, rf.currentTerm, DLeader, "%s->Leader, For T%s->T%s", rf.role, rf.currentTerm, term)
+	rf.role = Leader
 }
 
 // return currentTerm and whether this server
@@ -240,7 +303,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (PartA, PartB, PartC).
-
+	rf.role = Follower // initially a follower
+	rf.currentTerm = 0 // initially term is 0
+	rf.votedFor = -1 // initially no one has voted
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
