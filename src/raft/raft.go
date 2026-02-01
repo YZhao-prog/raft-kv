@@ -31,7 +31,8 @@ import (
 const (
 	electionTimeoutMin time.Duration = 250 * time.Millisecond
 	electionTimeoutMax time.Duration = 400 * time.Millisecond
-	replicateInterval time.Duration = 200 * time.Millisecond
+	// replicate interval, 30ms is enough for the network to replicate the log
+	replicateInterval time.Duration = 30 * time.Millisecond
 )
 
 // resetElectionTimeoutLocked sets a new random election timeout duration for this Raft peer.
@@ -90,10 +91,10 @@ type Raft struct {
 	// Your data here (PartA, PartB, PartC).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	role Role
-	currentTerm int
-	votedFor int // -1 if no one, otherwise candidate's id
-	electionStart time.Time // time when election started, used for election timeout
+	role            Role
+	currentTerm     int
+	votedFor        int           // -1 if no one, otherwise candidate's id
+	electionStart   time.Time     // time when election started, used for election timeout
 	electionTimeout time.Duration // duration of election timeout, random between 150-300ms
 }
 
@@ -106,7 +107,7 @@ func (rf *Raft) becomeFollowerLocked(term int) {
 		LOG(rf.me, term, DError, "Can't become follower in term %d, current term is %d", term, rf.currentTerm)
 	}
 
-	LOG(rf.me, term, DLog, "%s->Follower, For T%s->T%s", rf.role, rf.currentTerm, term)
+	LOG(rf.me, term, DLog, "%s->Follower, For T%d->T%d", rf.role, rf.currentTerm, term)
 	rf.role = Follower
 	if term > rf.currentTerm {
 		rf.votedFor = -1
@@ -114,22 +115,21 @@ func (rf *Raft) becomeFollowerLocked(term int) {
 	rf.currentTerm = term
 }
 
-
 // becomeCandidateLocked transitions the Raft server to the Candidate role.
 // If the server is currently the Leader, it logs an error and returns without changing state.
 // Otherwise, it updates its role to Candidate, increments its term, votes for itself,
 // and records the time the election started.
 func (rf *Raft) becomeCandidateLocked(term int) {
-	if rf.role == Leader {	
+	if rf.role == Leader {
 		LOG(rf.me, term, DError, "Can't become candidate, already leader")
 		return
 	}
 
-	LOG(rf.me, rf.currentTerm, DVote, "%s->Candidate, For T%s->T%s", rf.role, rf.currentTerm, term)
 	rf.currentTerm++
+	LOG(rf.me, rf.currentTerm, DVote, "%s->Candidate, For T%d->T%d", rf.role, rf.currentTerm-1, rf.currentTerm)
 	rf.role = Candidate
 	rf.votedFor = rf.me
-	rf.electionStart = time.Now()
+	rf.resetElectionTimeoutLocked()
 }
 
 // becomeLeaderLocked transitions the Raft server to the Leader role.
@@ -142,17 +142,18 @@ func (rf *Raft) becomeLeaderLocked(term int) {
 		return
 	}
 
-	LOG(rf.me, rf.currentTerm, DLeader, "%s->Leader, For T%s->T%s", rf.role, rf.currentTerm, term)
+	LOG(rf.me, rf.currentTerm, DLeader, "%s->Leader, For T%d->T%d", rf.role, rf.currentTerm, term)
 	rf.role = Leader
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	var term int
-	var isleader bool
-	// Your code here (PartA).
+	term := rf.currentTerm
+	isleader := rf.role == Leader
 	return term, isleader
 }
 
@@ -207,7 +208,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (PartA, PartB).
-	Term int // candidate's term
+	Term        int // candidate's term
 	CandidateId int // candidate requesting vote
 }
 
@@ -215,7 +216,7 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (PartA).
-	Term int // currentTerm, for candidate to update itself
+	Term        int  // currentTerm, for candidate to update itself
 	VoteGranted bool // true means candidate received vote for current term
 }
 
@@ -224,9 +225,10 @@ type RequestVoteReply struct {
 // This includes term comparison, log up-to-dateness check, and vote tracking for the current term.
 // This function should be called with the server's lock held to ensure state consistency.
 // Candidate.startElection
-//   -> sendRequestVote(peer, args, reply)
-//      -> labrpc.Call("Raft.RequestVote", ...)
-//         -> Raft.RequestVote(args, reply)
+//
+//	-> sendRequestVote(peer, args, reply)
+//	   -> labrpc.Call("Raft.RequestVote", ...)
+//	      -> Raft.RequestVote(args, reply)
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Acquire lock for concurrent safety
 	rf.mu.Lock()
@@ -342,15 +344,16 @@ func (rf *Raft) contextLostLocked(role Role, term int) bool {
 }
 
 type AppendEntriesArgs struct {
-	Term int
+	Term     int
 	LeaderId int
 }
 
 type AppendEntriesReply struct {
-	Term int
+	Term    int
 	Success bool
 }
 
+// AppendEntries is the RPC handler for the AppendEntries RPC.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -409,7 +412,7 @@ func (rf *Raft) startReplication(term int) bool {
 			continue
 		}
 		args := &AppendEntriesArgs{
-			Term: rf.currentTerm,
+			Term:     rf.currentTerm,
 			LeaderId: rf.me,
 		}
 		go replicateToPeer(peer, args)
@@ -458,7 +461,7 @@ func (rf *Raft) startElection(term int) {
 		// check the vote
 		if reply.VoteGranted {
 			votes++
-			if votes > len(rf.peers) / 2 {
+			if votes > len(rf.peers)/2 {
 				rf.becomeLeaderLocked(term)
 				go rf.replicationTickerLocked(term)
 			}
@@ -478,7 +481,7 @@ func (rf *Raft) startElection(term int) {
 			continue
 		}
 		args := &RequestVoteArgs{
-			Term: rf.currentTerm,
+			Term:        rf.currentTerm,
 			CandidateId: rf.me,
 		}
 		go askVoteFromPeer(peer, args)
@@ -522,7 +525,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (PartA, PartB, PartC).
 	rf.role = Follower // initially a follower
 	rf.currentTerm = 0 // initially term is 0
-	rf.votedFor = -1 // initially no one has voted
+	rf.votedFor = -1   // initially no one has voted
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
