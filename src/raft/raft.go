@@ -28,6 +28,26 @@ import (
 	"course/labrpc"
 )
 
+const (
+	electionTimeoutMin time.Duration = 250 * time.Millisecond
+	electionTimeoutMax time.Duration = 400 * time.Millisecond
+	replicateInterval time.Duration = 200 * time.Millisecond
+)
+
+// resetElectionTimeoutLocked sets a new random election timeout duration for this Raft peer.
+// Should be called while holding rf.mu. It also resets the electionStart time.
+// The new timeout is randomly chosen between electionTimeoutMin and electionTimeoutMax.
+func (rf *Raft) resetElectionTimeoutLocked() {
+	rf.electionStart = time.Now()
+	randRange := int64(electionTimeoutMax - electionTimeoutMin)
+	rf.electionTimeout = electionTimeoutMin + time.Duration(rand.Int63()%randRange)
+}
+
+// isElectionTimeout checks if the current time has exceeded the election timeout duration.
+// Returns true if the elapsed time is greater than the timeout, false otherwise.
+func (rf *Raft) isElectionTimeout() bool {
+	return time.Since(rf.electionStart) > rf.electionTimeout
+}
 
 // Role defines the role/state of a Raft server (Follower, Leader, or Candidate).
 type Role string
@@ -187,17 +207,59 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (PartA, PartB).
+	Term int // candidate's term
+	CandidateId int // candidate requesting vote
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (PartA).
+	Term int // currentTerm, for candidate to update itself
+	VoteGranted bool // true means candidate received vote for current term
 }
 
-// example RequestVote RPC handler.
+// RequestVote is the RPC handler invoked when a server receives a RequestVote RPC from a candidate.
+// It decides whether to grant its vote to the requesting candidate according to the Raft protocol.
+// This includes term comparison, log up-to-dateness check, and vote tracking for the current term.
+// This function should be called with the server's lock held to ensure state consistency.
+// Candidate.startElection
+//   -> sendRequestVote(peer, args, reply)
+//      -> labrpc.Call("Raft.RequestVote", ...)
+//         -> Raft.RequestVote(args, reply)
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (PartA, PartB).
+	// Acquire lock for concurrent safety
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// Always set reply term to this server's current term (so candidate can update itself)
+	reply.Term = rf.currentTerm
+
+	// Default to not granting the vote
+	reply.VoteGranted = false
+
+	// If candidate's term is less, reject immediately as outdated
+	if args.Term < rf.currentTerm {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, reject vote request, term %d > %d", args.CandidateId, args.Term, rf.currentTerm)
+		return
+	}
+
+	// If candidate's term is higher, convert to follower and update term
+	if args.Term > rf.currentTerm {
+		rf.becomeFollowerLocked(args.Term)
+	}
+
+	// If already voted for another candidate in this term, reject, make sure the voted for candidate is the same as the candidate requesting vote
+	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, reject vote request, already voted for S%d", args.CandidateId, rf.votedFor)
+		return
+	}
+
+	// Otherwise, grant vote to candidate, record vote, and reset election timer
+	reply.VoteGranted = true
+	rf.votedFor = args.CandidateId
+	rf.resetElectionTimeoutLocked()
+	LOG(rf.me, rf.currentTerm, DVote, "-> S%d, vote granted", args.CandidateId)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -273,12 +335,167 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
+// contextLostLocked checks if the context of the Raft server has been lost.
+// Returns true if the context has been lost, false otherwise.
+func (rf *Raft) contextLostLocked(role Role, term int) bool {
+	return !(rf.role == role && term == rf.currentTerm)
+}
+
+type AppendEntriesArgs struct {
+	Term int
+	LeaderId int
+}
+
+type AppendEntriesReply struct {
+	Term int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// always set reply term to this server's current term
+	reply.Term = rf.currentTerm
+	reply.Success = false
+	// check if the term is lower, if so, become follower
+	if args.Term < rf.currentTerm {
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject AppendEntries, Lower term %d < %d", args.LeaderId, args.Term, rf.currentTerm)
+		return
+	}
+	if args.Term >= rf.currentTerm {
+		rf.becomeFollowerLocked(args.Term)
+	}
+	// reset election timeout after successful AppendEntries
+	rf.resetElectionTimeoutLocked()
+	reply.Success = true
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+// startReplication starts replication to all peers.
+// It should only be called when the server is a Leader and is to replicate to all peers.
+// Logs an error and does not proceed if not currently a Leader.
+// Updates the role to Leader and logs the transition.
+func (rf *Raft) startReplication(term int) bool {
+	replicateToPeer := func(peer int, args *AppendEntriesArgs) {
+		reply := &AppendEntriesReply{}
+		// send append entries RPC to peer, no lock needed here because we are not accessing any shared state
+		ok := rf.sendAppendEntries(peer, args, reply)
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		// check if the request is successful
+		if !ok {
+			LOG(rf.me, rf.currentTerm, DLog, "Replicate to peer %d failed", peer)
+			return
+		}
+		// align term
+		if reply.Term > rf.currentTerm {
+			rf.becomeFollowerLocked(reply.Term)
+			return
+		}
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.contextLostLocked(Leader, term) {
+		LOG(rf.me, rf.currentTerm, DLog, "Lost Leader[T%d] to %s[T%d]", rf.currentTerm, rf.role, term)
+		return false
+	}
+	for peer := 0; peer < len(rf.peers); peer++ {
+		if peer == rf.me {
+			continue
+		}
+		args := &AppendEntriesArgs{
+			Term: rf.currentTerm,
+			LeaderId: rf.me,
+		}
+		go replicateToPeer(peer, args)
+	}
+	return true
+}
+
+// Could only replicate during the given term.
+func (rf *Raft) replicationTickerLocked(term int) {
+	for !rf.killed() {
+		ok := rf.startReplication(term)
+		if !ok {
+			break
+		}
+		time.Sleep(replicateInterval)
+	}
+}
+
+// startElection starts an election for the given term.
+// It should only be called when the server is a Candidate and is to become the Leader.
+// Logs an error and does not proceed if not currently a Candidate.
+// Updates the role to Leader and logs the transition.
+func (rf *Raft) startElection(term int) {
+	votes := 0
+	askVoteFromPeer := func(peer int, args *RequestVoteArgs) {
+		reply := &RequestVoteReply{}
+		// send request vote RPC to peer, no lock needed here because we are not accessing any shared state
+		ok := rf.sendRequestVote(peer, args, reply)
+		// handle reply
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if !ok {
+			LOG(rf.me, rf.currentTerm, DDebug, "Ask vote from peer %d failed", peer)
+			return
+		}
+		// align term
+		if reply.Term > rf.currentTerm {
+			rf.becomeFollowerLocked(reply.Term)
+			return
+		}
+		// check the context, make sure we are still a candidate
+		if rf.contextLostLocked(Candidate, term) {
+			LOG(rf.me, rf.currentTerm, DVote, "Lost context, aborting request vote to peer %d", peer)
+			return
+		}
+		// check the vote
+		if reply.VoteGranted {
+			votes++
+			if votes > len(rf.peers) / 2 {
+				rf.becomeLeaderLocked(term)
+				go rf.replicationTickerLocked(term)
+			}
+		}
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// startElection is called asynchronously via goroutine, so you cannot predict exactly when it will execute.
+	// Therefore, context checks must be performed at execution time to ensure expectations are still valid.
+	if rf.contextLostLocked(Candidate, term) {
+		LOG(rf.me, rf.currentTerm, DVote, "Lost Candidate to %s, aborting RequestVote", rf.role)
+		return
+	}
+	for peer := 0; peer < len(rf.peers); peer++ {
+		if peer == rf.me {
+			votes++
+			continue
+		}
+		args := &RequestVoteArgs{
+			Term: rf.currentTerm,
+			CandidateId: rf.me,
+		}
+		go askVoteFromPeer(peer, args)
+	}
+}
+
+func (rf *Raft) electionTicker() {
+	for !rf.killed() {
 
 		// Your code here (PartA)
 		// Check if a leader election should be started.
-
+		rf.mu.Lock()
+		if rf.role != Leader && rf.isElectionTimeout() {
+			rf.becomeCandidateLocked(rf.currentTerm)
+			go rf.startElection(rf.currentTerm)
+		}
+		rf.mu.Unlock()
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
@@ -310,7 +527,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	go rf.electionTicker()
 
 	return rf
 }
