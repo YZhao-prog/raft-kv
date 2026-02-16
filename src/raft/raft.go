@@ -31,7 +31,7 @@ const (
 	electionTimeoutMin time.Duration = 250 * time.Millisecond
 	electionTimeoutMax time.Duration = 400 * time.Millisecond
 	// replicate interval, 30ms is enough for the network to replicate the log
-	replicateInterval time.Duration = 30 * time.Millisecond
+	replicateInterval time.Duration = 50 * time.Millisecond
 )
 
 // Role defines the role/state of a Raft server (Follower, Leader, or Candidate).
@@ -75,13 +75,19 @@ type Raft struct {
 	// Your data here (PartA, PartB, PartC).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	role            Role
-	currentTerm     int
-	votedFor        int           // -1 if no one, otherwise candidate's id
-	log             []LogEntry    // the log of the server
+	role        Role
+	currentTerm int
+	votedFor    int        // -1 if no one, otherwise candidate's id
+	log         []LogEntry // the log of the server
 
-	nextIndex       []int         // the next index to replicate to each peer
-	matchIndex      []int         // the last index replicated to each peer
+	nextIndex  []int // the next index to replicate to each peer
+	matchIndex []int // the last index replicated to each peer
+
+	// fields for apply loop
+	commitIndex int           // the commit index
+	lastApplied int           // the last applied index
+	applyCh     chan ApplyMsg // channel for applying messages to the state machine
+	applyCond   *sync.Cond    // condition variable for applying messages
 
 	electionStart   time.Time     // time when election started, used for election timeout
 	electionTimeout time.Duration // duration of election timeout, random between 150-300ms
@@ -213,13 +219,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// check if the server is a leader
+	if rf.role != Leader {
+		return 0, 0, false
+	}
 	// Your code here (PartB).
-
-	return index, term, isLeader
+	// append the command to the log
+	rf.log = append(rf.log, LogEntry{CommandValid: true, Command: command, Term: rf.currentTerm})
+	LOG(rf.me, rf.currentTerm, DLeader, "-> S%d, Start, Append command %v to leader's log, log index=%d", rf.me, command, len(rf.log)-1)
+	return len(rf.log) - 1, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -272,11 +282,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize nextIndex and matchIndex for each peer
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	// initialize applyCh and applyCond
+	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.electionTicker()
-
+	// start apply goroutine to apply messages to the state machine
+	go rf.applicationTicker()
 	return rf
 }

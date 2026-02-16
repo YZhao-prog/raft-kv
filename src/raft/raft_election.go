@@ -20,12 +20,25 @@ func (rf *Raft) isElectionTimeout() bool {
 	return time.Since(rf.electionStart) > rf.electionTimeout
 }
 
+// check if my log is more up to date than the candidate's log
+func (rf *Raft) isMoreUpToDateLocked(candidateIndex int, candidateTerm int) bool {
+	l := len(rf.log)
+	lastIndex, lastTerm := l-1, rf.log[l-1].Term
+	LOG(rf.me, rf.currentTerm, DVote, "isMoreUpToDate: myLastIndex=%d, myLastTerm=%d, candidateIndex=%d, candidateTerm=%d", lastIndex, lastTerm, candidateIndex, candidateTerm)
+	if lastTerm != candidateTerm {
+		return lastTerm > candidateTerm
+	}
+	return lastIndex > candidateIndex
+}
+
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (PartA, PartB).
-	Term        int // candidate's term
-	CandidateId int // candidate requesting vote
+	Term         int // candidate's term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // candidate's last log index
+	LastLogTerm  int // candidate's last log term
 }
 
 // example RequestVote RPC reply structure.
@@ -70,6 +83,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// If already voted for another candidate in this term, reject, make sure the voted for candidate is the same as the candidate requesting vote
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
 		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, reject vote request, already voted for S%d", args.CandidateId, rf.votedFor)
+		return
+	}
+
+	// check if candidate's log is less recent than mine
+	// true means candidate's log is less recent than mine
+	if rf.isMoreUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, reject vote request, candidate's log is less recent than mine, candidateLastIndex=%d, candidateLastTerm=%d", args.CandidateId, args.LastLogIndex, args.LastLogTerm)
 		return
 	}
 
@@ -136,7 +156,7 @@ func (rf *Raft) startElection(term int) {
 		}
 		// check the context, make sure we are still a candidate
 		if rf.contextLostLocked(Candidate, term) {
-			LOG(rf.me, rf.currentTerm, DVote, "Lost context, aborting request vote to peer %d", peer)
+			LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Context lost, T%d:Candidate->T%d:%s", peer, term, rf.currentTerm, rf.role)
 			return
 		}
 		// check the vote
@@ -153,17 +173,21 @@ func (rf *Raft) startElection(term int) {
 	// startElection is called asynchronously via goroutine, so you cannot predict exactly when it will execute.
 	// Therefore, context checks must be performed at execution time to ensure expectations are still valid.
 	if rf.contextLostLocked(Candidate, term) {
-		LOG(rf.me, rf.currentTerm, DVote, "Lost Candidate to %s, aborting RequestVote", rf.role)
+		LOG(rf.me, rf.currentTerm, DVote, "Context lost, T%d:Candidate->T%d:%s", term, rf.currentTerm, rf.role)
 		return
 	}
+
+	l := len(rf.log)
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
 			votes++
 			continue
 		}
 		args := &RequestVoteArgs{
-			Term:        rf.currentTerm,
-			CandidateId: rf.me,
+			Term:         rf.currentTerm,
+			CandidateId:  rf.me,
+			LastLogIndex: l - 1,
+			LastLogTerm:  rf.log[l-1].Term,
 		}
 		go askVoteFromPeer(peer, args)
 	}
