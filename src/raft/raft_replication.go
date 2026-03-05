@@ -26,6 +26,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int // responder's current term, for leader to update itself
 	Success bool
+	ConflictIndex int // the index of the first log entry that conflicts with the leader's log
+	ConflictTerm int // the term of the first log entry that conflicts with the leader's log
 }
 
 // AppendEntries is the RPC handler for the AppendEntries RPC.
@@ -53,16 +55,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}()
 	// return if prevLog not matched
 	if args.PrevLogIndex >= len(rf.log) {
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = InvalidTerm
 		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject AppendEntries, follower's log is shorter than leader's prevLogIndex, len(log)=%d < P`%d", args.LeaderId, len(rf.log), args.PrevLogIndex)
 		return
 	}
 	// return if prevLogTerm not matched
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.ConflictIndex = rf.firstLogFor(reply.ConflictTerm)
 		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject AppendEntries, follower's prevLogTerm %d != leader's prevLogTerm %d", args.LeaderId, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
 		return
 	}
 	// append new entries to the follower's log
 	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	rf.persistLocked()
 	reply.Success = true
 	LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, AppendEntries, follower accepted [%d,%d] entries", args.LeaderId, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries))
 	// handle leader commit index(PartB)
@@ -123,15 +130,27 @@ func (rf *Raft) startReplication(term int) bool {
 			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Context lost, T%d:Leader->T%d:%s", peer, term, rf.currentTerm, rf.role)
 			return
 		}
-		// handle failed reply, go back one term
 		if !reply.Success {
+			// Log fallback: use follower's ConflictIndex/ConflictTerm to backtrack nextIndex in one
+			// step instead of decrementing index-by-index (§5.3).
+			// Case 1 — ConflictTerm == InvalidTerm: follower log too short (PrevLogIndex >= len).
+			//   Follower set ConflictIndex = len(log). Set nextIndex = ConflictIndex so next
+			//   PrevLogIndex = nextIndex-1 aligns with follower's last entry (or before).
+			// Case 2 — ConflictTerm set: term mismatch at PrevLogIndex; follower set
+			//   ConflictIndex = first index of that term in its log. If leader has that term,
+			//   set nextIndex to leader's first index of ConflictTerm; else use ConflictIndex.
 			prevIndex := rf.nextIndex[peer]
-			idx, termVal := args.PrevLogIndex, args.PrevLogTerm
-			for idx > 0 && termVal == rf.log[idx].Term {
-				idx--
+			if reply.ConflictTerm == InvalidTerm {
+				rf.nextIndex[peer] = reply.ConflictIndex
+			} else {
+				firstLogIndex := rf.firstLogFor(reply.ConflictTerm)
+				if firstLogIndex != InvalidIndex {
+					rf.nextIndex[peer] = firstLogIndex
+				} else {
+					rf.nextIndex[peer] = reply.ConflictIndex
+				}
 			}
-			rf.nextIndex[peer] = idx + 1
-			// avoid out-of-order reply moving nextIndex forward
+			// Late reply must not move nextIndex forward.
 			if rf.nextIndex[peer] > prevIndex {
 				rf.nextIndex[peer] = prevIndex
 			}

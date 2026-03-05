@@ -96,6 +96,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Otherwise, grant vote to candidate, record vote, and reset election timer
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateId
+	rf.persistLocked()
 	rf.resetElectionTimeoutLocked()
 	LOG(rf.me, rf.currentTerm, DVote, "-> S%d, vote granted", args.CandidateId)
 }
