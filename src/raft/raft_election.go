@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"math/rand"
 	"time"
 )
@@ -41,12 +42,20 @@ type RequestVoteArgs struct {
 	LastLogTerm  int // candidate's last log term
 }
 
+func (args *RequestVoteArgs) String() string {
+	return fmt.Sprintf("Term=%d, CandidateId=%d, LastLogIndex=%d, LastLogTerm=%d", args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
+}
+
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (PartA).
 	Term        int  // currentTerm, for candidate to update itself
 	VoteGranted bool // true means candidate received vote for current term
+}
+
+func (reply *RequestVoteReply) String() string {
+	return fmt.Sprintf("Term=%d, VoteGranted=%t", reply.Term, reply.VoteGranted)
 }
 
 // RequestVote is the RPC handler invoked when a server receives a RequestVote RPC from a candidate.
@@ -62,7 +71,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Acquire lock for concurrent safety
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	// log the vote request
+	LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, vote request: %s", args.CandidateId, args.String())
 	// Always set reply term to this server's current term (so candidate can update itself)
 	reply.Term = rf.currentTerm
 
@@ -71,7 +81,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// If candidate's term is less, reject immediately as outdated
 	if args.Term < rf.currentTerm {
-		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, reject vote request, term %d > %d", args.CandidateId, args.Term, rf.currentTerm)
+		LOG(rf.me, rf.currentTerm, DVote, "<- S%d, Reject vote request, term %d > %d", args.CandidateId, args.Term, rf.currentTerm)
 		return
 	}
 
@@ -82,14 +92,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// If already voted for another candidate in this term, reject, make sure the voted for candidate is the same as the candidate requesting vote
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
-		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, reject vote request, already voted for S%d", args.CandidateId, rf.votedFor)
+		LOG(rf.me, rf.currentTerm, DVote, "<- S%d, Reject vote request, already voted for S%d", args.CandidateId, rf.votedFor)
 		return
 	}
 
 	// check if candidate's log is less recent than mine
 	// true means candidate's log is less recent than mine
 	if rf.isMoreUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
-		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, reject vote request, candidate's log is less recent than mine, candidateLastIndex=%d, candidateLastTerm=%d", args.CandidateId, args.LastLogIndex, args.LastLogTerm)
+		LOG(rf.me, rf.currentTerm, DVote, "<- S%d, Reject vote request, candidate's log is less recent than mine, candidateLastIndex=%d, candidateLastTerm=%d", args.CandidateId, args.LastLogIndex, args.LastLogTerm)
 		return
 	}
 
@@ -98,7 +108,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.votedFor = args.CandidateId
 	rf.persistLocked()
 	rf.resetElectionTimeoutLocked()
-	LOG(rf.me, rf.currentTerm, DVote, "-> S%d, vote granted", args.CandidateId)
+	LOG(rf.me, rf.currentTerm, DVote, "<- S%d, Vote granted", args.CandidateId)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -150,6 +160,7 @@ func (rf *Raft) startElection(term int) {
 			LOG(rf.me, rf.currentTerm, DDebug, "Ask vote from peer %d failed", peer)
 			return
 		}
+		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, AskVote Reply=%v", peer, reply.String())
 		// align term
 		if reply.Term > rf.currentTerm {
 			rf.becomeFollowerLocked(reply.Term)
@@ -190,6 +201,7 @@ func (rf *Raft) startElection(term int) {
 			LastLogIndex: l - 1,
 			LastLogTerm:  rf.log[l-1].Term,
 		}
+		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, AskVote, Args=%v", peer, args.String())
 		go askVoteFromPeer(peer, args)
 	}
 }

@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,10 +29,11 @@ import (
 )
 
 const (
-	electionTimeoutMin time.Duration = 250 * time.Millisecond
-	electionTimeoutMax time.Duration = 400 * time.Millisecond
-	// replicate interval, 30ms is enough for the network to replicate the log
-	replicateInterval time.Duration = 50 * time.Millisecond
+	// Slightly higher/longer to reduce split votes and fewer RPCs in initial election window (TestCountPartB expects ≤30).
+	electionTimeoutMin time.Duration = 280 * time.Millisecond
+	electionTimeoutMax time.Duration = 420 * time.Millisecond
+	// Heartbeat interval; 80ms keeps RPC count under limit while still << electionTimeout.
+	replicateInterval time.Duration = 80 * time.Millisecond
 )
 
 const (
@@ -170,6 +172,30 @@ func (rf *Raft) firstLogFor(term int) int {
 		}
 	}
 	return InvalidIndex
+}
+
+
+// logString returns a string summarizing the current log entries grouped by term.
+// The output format is e.g. "[0, 2]T1,[3, 3]T2,[4, 5]T3"
+func (rf *Raft) logString() string {
+	// Handle the case when the log is empty
+	if len(rf.log) == 0 {
+		return ""
+	}
+	var terms string
+	prevTerm := rf.log[0].Term
+	prevStart := 0
+	for idx, entry := range rf.log {
+		if entry.Term != prevTerm {
+			// Append group summary for previous term
+			terms += fmt.Sprintf("[%d, %d]T%d,", prevStart, idx-1, prevTerm)
+			prevStart = idx
+			prevTerm = entry.Term
+		}
+	}
+	// Append the summary for the final group
+	terms += fmt.Sprintf("[%d, %d]T%d", prevStart, len(rf.log)-1, prevTerm)
+	return terms
 }
 
 // return currentTerm and whether this server

@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"sort"
 	"time"
 )
@@ -22,12 +23,20 @@ type AppendEntriesArgs struct {
 	LeaderCommit int        // leader’s commitIndex
 }
 
+func (args *AppendEntriesArgs) String() string {
+	return fmt.Sprintf("Term=%d, LeaderId=%d, PrevLogIndex=%d, PrevLogTerm=%d, (%d, %d], LeaderCommit=%d", args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.PrevLogIndex, args.PrevLogIndex+len(args.Entries), args.LeaderCommit)
+}
+
 // AppendEntriesReply defines the reply for an AppendEntries RPC in Raft.
 type AppendEntriesReply struct {
-	Term    int // responder's current term, for leader to update itself
-	Success bool
+	Term          int // responder's current term, for leader to update itself
+	Success       bool
 	ConflictIndex int // the index of the first log entry that conflicts with the leader's log
-	ConflictTerm int // the term of the first log entry that conflicts with the leader's log
+	ConflictTerm  int // the term of the first log entry that conflicts with the leader's log
+}
+
+func (reply *AppendEntriesReply) String() string {
+	return fmt.Sprintf("Term=%d, Success=%t, ConflictIndex=%d, ConflictTerm=%d", reply.Term, reply.Success, reply.ConflictIndex, reply.ConflictTerm)
 }
 
 // AppendEntries is the RPC handler for the AppendEntries RPC.
@@ -35,6 +44,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Receive AppendEntries, Args=%s", args.LeaderId, args.String())
 	// always set reply term to this server's current term
 	reply.Term = rf.currentTerm
 	reply.Success = false
@@ -51,6 +61,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer func() {
 		if args.Term >= rf.currentTerm {
 			rf.resetElectionTimeoutLocked()
+			// log the conflict if the follower is not successful
+			if !reply.Success {
+				LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Follower conflict: [%d]T%d", args.LeaderId, reply.ConflictIndex, reply.ConflictTerm)
+				LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Follower log: %s", args.LeaderId, rf.logString())
+			}
 		}
 	}()
 	// return if prevLog not matched
@@ -120,6 +135,7 @@ func (rf *Raft) startReplication(term int) bool {
 			LOG(rf.me, rf.currentTerm, DLog, "Replicate to peer %d failed", peer)
 			return
 		}
+		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, AppendEntries Reply=%v", peer, reply.String())
 		// align term
 		if reply.Term > rf.currentTerm {
 			rf.becomeFollowerLocked(reply.Term)
@@ -154,7 +170,8 @@ func (rf *Raft) startReplication(term int) bool {
 			if rf.nextIndex[peer] > prevIndex {
 				rf.nextIndex[peer] = prevIndex
 			}
-			LOG(rf.me, rf.currentTerm, DLog, "Replicate to peer %d failed, backtrack to %d", peer, rf.nextIndex[peer])
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not match at Prev = [%d]T%d, try next Prev = [%d]T%d", peer, args.PrevLogIndex, args.PrevLogTerm, rf.nextIndex[peer] - 1, rf.log[rf.nextIndex[peer] - 1].Term)
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Leader's log = %s", peer, rf.logString())
 			return
 		}
 		// update nextIndex and matchIndex if successful
@@ -196,6 +213,7 @@ func (rf *Raft) startReplication(term int) bool {
 			Entries:      rf.log[prevIndex+1:],
 			LeaderCommit: rf.commitIndex,
 		}
+		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Send AppendEntries, Args=%s", peer, args.String())
 		go replicateToPeer(peer, args)
 	}
 	return true
