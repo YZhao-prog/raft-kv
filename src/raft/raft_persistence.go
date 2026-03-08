@@ -7,7 +7,7 @@ import (
 )
 
 func (rf *Raft) persistString() string {
-	return fmt.Sprintf("currentTerm: %d, votedFor: %d, log: [0:%d]", rf.currentTerm, rf.votedFor, len(rf.log)-1)
+	return fmt.Sprintf("currentTerm: %d, votedFor: %d, log: [0:%d]", rf.currentTerm, rf.votedFor, rf.log.size()-1)
 }
 
 // save Raft's persistent state to stable storage,
@@ -22,10 +22,10 @@ func (rf *Raft) persistLocked() {
 	// Your code here (PartC).
 	w := new(bytes.Buffer) // create a new buffer to store the encoded data
 	e := labgob.NewEncoder(w) // create a new encoder to encode the data
-	e.Encode(rf.currentTerm) // encode the currentTerm field
-	e.Encode(rf.votedFor) // encode the votedFor field
-	e.Encode(rf.log) // encode the log field
-	raftstate := w.Bytes() // get the encoded data bytes array
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	rf.log.persist(e) // encode the log
+	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, nil) // save the encoded data bytes array to the persister
 	LOG(rf.me, rf.currentTerm, DPersist, "persist to disk: %s", rf.persistString())
 }
@@ -36,25 +36,24 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (PartC).
-	var currentTerm int
-	var votedFor int
-	var log []LogEntry
 	r := bytes.NewBuffer(data) // create a new buffer to store the encoded data
-	d := labgob.NewDecoder(r) // create a new decoder to decode the data
+	d := labgob.NewDecoder(r) // create a new decoder to decode the data create a new decoder to decode the data
+	var currentTerm int
 	if err := d.Decode(&currentTerm); err != nil {
 		LOG(rf.me, rf.currentTerm, DPersist, "read from disk: decode currentTerm error")
 		return
 	}
 	rf.currentTerm = currentTerm
+	var votedFor int
 	if err := d.Decode(&votedFor); err != nil {
 		LOG(rf.me, rf.currentTerm, DPersist, "read from disk: decode votedFor error")
 		return
 	}
 	rf.votedFor = votedFor
-	if err := d.Decode(&log); err != nil {
+	// decode the log
+	if err := rf.log.readPersist(d); err != nil {
 		LOG(rf.me, rf.currentTerm, DPersist, "read from disk: decode log error")
 		return
 	}
-	rf.log = log
 	LOG(rf.me, rf.currentTerm, DPersist, "read from disk: %s", rf.persistString())
 }

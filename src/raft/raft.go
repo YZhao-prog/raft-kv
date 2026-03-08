@@ -18,13 +18,10 @@ package raft
 //
 
 import (
-	//	"bytes"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"course/labgob"
 	"course/labrpc"
 )
 
@@ -85,7 +82,7 @@ type Raft struct {
 	role        Role
 	currentTerm int
 	votedFor    int        // -1 if no one, otherwise candidate's id
-	log         []LogEntry // the log of the server
+	log         *RaftLog // the log of the server
 
 	nextIndex  []int // the next index to replicate to each peer
 	matchIndex []int // the last index replicated to each peer
@@ -156,46 +153,9 @@ func (rf *Raft) becomeLeaderLocked(term int) {
 		if peer == rf.me {
 			continue
 		}
-		rf.nextIndex[peer] = len(rf.log)
+		rf.nextIndex[peer] = rf.log.size()
 		rf.matchIndex[peer] = 0
 	}
-}
-
-// firstLogFor returns the first log entry for the given term.
-// If the term is invalid, returns InvalidIndex.
-func (rf *Raft) firstLogFor(term int) int {
-	for idx, entry := range rf.log {
-		if entry.Term == term {
-			return idx
-		} else if entry.Term > term {
-			break
-		}
-	}
-	return InvalidIndex
-}
-
-
-// logString returns a string summarizing the current log entries grouped by term.
-// The output format is e.g. "[0, 2]T1,[3, 3]T2,[4, 5]T3"
-func (rf *Raft) logString() string {
-	// Handle the case when the log is empty
-	if len(rf.log) == 0 {
-		return ""
-	}
-	var terms string
-	prevTerm := rf.log[0].Term
-	prevStart := 0
-	for idx, entry := range rf.log {
-		if entry.Term != prevTerm {
-			// Append group summary for previous term
-			terms += fmt.Sprintf("[%d, %d]T%d,", prevStart, idx-1, prevTerm)
-			prevStart = idx
-			prevTerm = entry.Term
-		}
-	}
-	// Append the summary for the final group
-	terms += fmt.Sprintf("[%d, %d]T%d", prevStart, len(rf.log)-1, prevTerm)
-	return terms
 }
 
 // return currentTerm and whether this server
@@ -209,13 +169,13 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
+// Snapshot is called by the application when it has applied through index and created a snapshot.
+// The application passes the snapshot bytes; Raft truncates the log to that index and persists.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (PartD).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.log.doSnapshot(index, snapshot)
+	rf.persistLocked()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -238,11 +198,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return 0, 0, false
 	}
 	// Your code here (PartB).
-	// append the command to the log
-	rf.log = append(rf.log, LogEntry{CommandValid: true, Command: command, Term: rf.currentTerm})
+	// append the new entry to the log
+	rf.log.append(LogEntry{
+		CommandValid: true,
+		Command:      command,
+		Term:         rf.currentTerm,
+	})
 	rf.persistLocked()
-	LOG(rf.me, rf.currentTerm, DLeader, "-> S%d, Start, Append command %v to leader's log, log index=%d", rf.me, command, len(rf.log)-1)
-	return len(rf.log) - 1, rf.currentTerm, true
+	// return the index of the new entry
+	idx := rf.log.size() - 1
+	LOG(rf.me, rf.currentTerm, DLeader, "-> S%d, Start, Append command %v to leader's log, log index=%d", rf.me, command, idx)
+	return idx, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -290,8 +256,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = Follower // initially a follower
 	rf.currentTerm = 1 // initially term is 1
 	rf.votedFor = -1   // initially no one has voted
-	// initially a dummy log entry to avoid corner cases, term is invalid because it's not committed yet
-	rf.log = append(rf.log, LogEntry{Command: nil, Term: InvalidTerm})
+	// initially empty log: snapLastIndex=0, dummy at index 0
+	rf.log = NewLog(InvalidIndex, InvalidTerm, nil, nil)
 	// initialize nextIndex and matchIndex for each peer
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))

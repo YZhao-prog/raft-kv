@@ -16,7 +16,7 @@ func (rf *Raft) applicationTicker() {
 		// Gather new entries to apply: (lastApplied, commitIndex]
 		entries := make([]LogEntry, 0)
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			entries = append(entries, rf.log[i])
+			entries = append(entries, rf.log.at(i))
 		}
 		rf.mu.Unlock()
 
