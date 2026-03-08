@@ -2,3 +2,11 @@ pkg/
 api.key
 .api.key.trimmed
 *-handin.tar.gz
+
+# OS & IDE
+.DS_Store
+.idea/
+
+# Raft test output
+src/raft/out.txt
+src/raft/20260305_063540/
