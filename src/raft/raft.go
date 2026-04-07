@@ -92,6 +92,7 @@ type Raft struct {
 	lastApplied int           // the last applied index
 	applyCh     chan ApplyMsg // channel for applying messages to the state machine
 	applyCond   *sync.Cond    // condition variable for applying messages
+	snapPending bool          // whether a snapshot is pending
 
 	electionStart   time.Time     // time when election started, used for election timeout
 	electionTimeout time.Duration // duration of election timeout, random between 150-300ms
@@ -169,14 +170,6 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-// Snapshot is called by the application when it has applied through index and created a snapshot.
-// The application passes the snapshot bytes; Raft truncates the log to that index and persists.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.log.doSnapshot(index, snapshot)
-	rf.persistLocked()
-}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -195,7 +188,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 	// check if the server is a leader
 	if rf.role != Leader {
-		return 0, 0, false
+		return 0, rf.currentTerm, false
 	}
 	// Your code here (PartB).
 	// append the new entry to the log
@@ -264,6 +257,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize applyCh and applyCond
 	rf.applyCh = applyCh
 	rf.applyCond = sync.NewCond(&rf.mu)
+	// initialize snapPending
+	rf.snapPending = false
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 

@@ -72,9 +72,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	// log the vote request
 	LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, vote request: %s", args.CandidateId, args.String())
-	// Always set reply term to this server's current term (so candidate can update itself)
+	// Always return our current term to help candidate step down quickly.
 	reply.Term = rf.currentTerm
-
 	// Default to not granting the vote
 	reply.VoteGranted = false
 
@@ -88,6 +87,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.becomeFollowerLocked(args.Term)
 	}
+	// Reply must carry the latest local term after any term/role transition.
+	reply.Term = rf.currentTerm
 
 	// If already voted for another candidate in this term, reject, make sure the voted for candidate is the same as the candidate requesting vote
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {

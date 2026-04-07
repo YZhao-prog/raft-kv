@@ -45,17 +45,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Receive AppendEntries, Args=%s", args.LeaderId, args.String())
-	// always set reply term to this server's current term
-	reply.Term = rf.currentTerm
 	reply.Success = false
 	// check if the term is lower, if so, become follower
 	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
 		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject AppendEntries, Lower term %d < %d", args.LeaderId, args.Term, rf.currentTerm)
 		return
 	}
 	if args.Term >= rf.currentTerm {
 		rf.becomeFollowerLocked(args.Term)
 	}
+	// Reply must carry the latest local term after any term/role transition.
+	reply.Term = rf.currentTerm
 	// Reset election timeout whenever we receive valid AppendEntries (term >= ours), even on reject
 	// legal leader can always reset election timeout
 	defer func() {
@@ -68,6 +69,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 	}()
+	// PrevLogIndex is before our compacted prefix: entry is not in tailLog (stale RPC or leader behind our snapshot).
+	if args.PrevLogIndex < rf.log.snapLastIndex {
+		reply.ConflictIndex = rf.log.snapLastIndex + 1
+		reply.ConflictTerm = InvalidTerm
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject AppendEntries, prevLogIndex %d < snapLastIndex %d (stale)", args.LeaderId, args.PrevLogIndex, rf.log.snapLastIndex)
+		return
+	}
 	// return if prevLog not matched (log too short)
 	if args.PrevLogIndex >= rf.log.size() {
 		reply.ConflictIndex = rf.log.size()
@@ -170,7 +178,13 @@ func (rf *Raft) startReplication(term int) bool {
 			if rf.nextIndex[peer] > prevIndex {
 				rf.nextIndex[peer] = prevIndex
 			}
-			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not match at Prev = [%d]T%d, try next Prev = [%d]T%d", peer, args.PrevLogIndex, args.PrevLogTerm, rf.nextIndex[peer]-1, rf.log.at(rf.nextIndex[peer]-1).Term)
+			// Log next append anchor; index may lie only in snapshot ( < snapLastIndex ) or past tail — skip at().
+			nextPrevIndex := rf.nextIndex[peer] - 1
+			nextPrevTerm := InvalidTerm
+			if nextPrevIndex >= rf.log.snapLastIndex && nextPrevIndex < rf.log.size() {
+				nextPrevTerm = rf.log.at(nextPrevIndex).Term
+			}
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not match at Prev = [%d]T%d, try next Prev = [%d]T%d", peer, args.PrevLogIndex, args.PrevLogTerm, nextPrevIndex, nextPrevTerm)
 			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Leader's log = %s", peer, rf.log.String())
 			return
 		}
@@ -204,6 +218,20 @@ func (rf *Raft) startReplication(term int) bool {
 		}
 		// get the previous log index and term to send to the peer
 		prevIndex := rf.nextIndex[peer] - 1
+		// if the previous log index is less than the snapshot last index, send install snapshot RPC
+		if prevIndex < rf.log.snapLastIndex {
+			args := &InstallSnapshotArgs{
+				Term:              rf.currentTerm,
+				LeaderId:          rf.me,
+				LastIncludedIndex: rf.log.snapLastIndex,
+				LastIncludedTerm:  rf.log.snapLastTerm,
+				Snapshot:          rf.log.snapshot,
+			}
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Send InstallSnapshot, Args=%s", peer, args.String())
+			go rf.installToPeer(peer, term, args)
+			// skip the rest of the loop
+			continue
+		}
 		prevTerm := rf.log.at(prevIndex).Term
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
@@ -211,7 +239,7 @@ func (rf *Raft) startReplication(term int) bool {
 			PrevLogIndex: prevIndex,
 			PrevLogTerm:  prevTerm,
 			// send the tail log entries from the previous log index + 1
-			Entries:      rf.log.tail(prevIndex+1),
+			Entries:      rf.log.tail(prevIndex + 1),
 			LeaderCommit: rf.commitIndex,
 		}
 		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Send AppendEntries, Args=%s", peer, args.String())

@@ -26,7 +26,7 @@ func (rf *Raft) persistLocked() {
 	e.Encode(rf.votedFor)
 	rf.log.persist(e) // encode the log
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil) // save the encoded data bytes array to the persister
+	rf.persister.Save(raftstate, rf.log.snapshot) // save the encoded data bytes array and the snapshot to the persister
 	LOG(rf.me, rf.currentTerm, DPersist, "persist to disk: %s", rf.persistString())
 }
 
@@ -54,6 +54,13 @@ func (rf *Raft) readPersist(data []byte) {
 	if err := rf.log.readPersist(d); err != nil {
 		LOG(rf.me, rf.currentTerm, DPersist, "read from disk: decode log error")
 		return
+	}
+	rf.log.snapshot = rf.persister.ReadSnapshot() // read the snapshot from the persister
+	// the readSnapshot function reset the commit index and last applied index to zero
+	// so we need to update the commit index and last applied index if the last included index is greater than the commit index
+	if rf.log.snapLastIndex > rf.commitIndex {
+		rf.commitIndex = rf.log.snapLastIndex
+		rf.lastApplied = rf.log.snapLastIndex
 	}
 	LOG(rf.me, rf.currentTerm, DPersist, "read from disk: %s", rf.persistString())
 }

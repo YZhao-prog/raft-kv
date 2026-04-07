@@ -137,23 +137,39 @@ func (rl *RaftLog) tail(startIdx int) []LogEntry {
 	return rl.tailLog[rl.idx(startIdx):]
 }
  
-// doSnapshot records that log through index is in the snapshot and trims tailLog.
-// The snapshot bytes are produced by the caller (e.g. KV server) and passed in; Raft only stores them.
+// doSnapshot is used when the application has applied through index and produced snapshot bytes.
+// It moves the compaction boundary to index: entries [1,index] are represented only by snapshot;
+// snapLastTerm is taken from the log entry at index. The in-memory tail keeps a dummy at index
+// plus any existing entries after index so replication can continue without resending the compacted prefix.
 func (rl *RaftLog) doSnapshot(index int, snapshot []byte) {
-	// get the tail log index of the snapshot
 	idx := rl.idx(index)
 	rl.snapLastIndex = index
 	rl.snapLastTerm = rl.tailLog[idx].Term
 	rl.snapshot = snapshot
-	// trim the log
 	newLog := make([]LogEntry, 0, len(rl.tailLog)-idx)
 	newLog = append(newLog, LogEntry{
-		CommandValid: false, 
-		Command: nil, 
+		CommandValid: false,
+		Command:      nil,
+		Term:         rl.snapLastTerm,
+	})
+	newLog = append(newLog, rl.tailLog[idx+1:]...)
+	rl.tailLog = newLog
+}
+
+// installSnapshot replaces the log prefix on a follower after an InstallSnapshot RPC from the leader.
+// index and term are LastIncludedIndex and LastIncludedTerm; snapshot holds the leader's state-machine image.
+// The old tail is discarded: it may conflict with the leader or lie in a range the leader no longer has as entries.
+// tailLog is reset to a single dummy at index so AppendEntries can append from index+1 onward.
+func (rl *RaftLog) installSnapshot(index int, term int, snapshot []byte) {
+	rl.snapLastIndex = index
+	rl.snapLastTerm = term
+	rl.snapshot = snapshot
+	newLog := make([]LogEntry, 0, 1)
+	newLog = append(newLog, LogEntry{
+		CommandValid: false,
+		Command: nil,
 		Term: rl.snapLastTerm,
 	})
-	// append the remaining log
-	newLog = append(newLog, rl.tailLog[idx+1:]...)
 	rl.tailLog = newLog
 }
 
